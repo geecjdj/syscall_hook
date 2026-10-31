@@ -19,6 +19,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -108,35 +109,55 @@ private fun AppRoot() {
     }
 
     // One poller for the whole app (restarted for every new session): reads the module's log from
-    // dmesg once a second and, while auto timeout is on, sends the heartbeat every 5 s.
+    // dmesg and, while auto timeout is on, sends the heartbeat every 5 s. The heartbeat also runs
+    // while this app is in the background (the user is busy in the traced app then); only the
+    // dmesg polling slows down, so the module neither stops tracing nor does the kernel buffer wrap.
     LaunchedEffect(sessionId) {
         log.reset(if (sessionId == 0) "Waiting for events..." else "Setting up...")
-        withContext(Dispatchers.IO) { pushModuleSettings(ctx) }
+
+        suspend fun poll() {
+            val res = withContext(Dispatchers.IO) { Su.run("dmesg | grep -F '[SCL]' | tail -n 4000; true") }
+            if (res.rc != 0) {
+                log.status = "su failed (rc=${res.rc}): ${res.err.trim()}. Grant root to this app in APatch."
+            } else {
+                log.onSnapshot(res.out, res.err)
+            }
+        }
+
+        // Baseline first, so events right after the targets were set are not skipped.
+        try {
+            poll()
+            withContext(Dispatchers.IO) { pushModuleSettings(ctx) }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            log.status = "Error: ${e.message ?: e}"
+        }
         var tick = 0
         var wasForeground = true
         while (true) {
-            val fg = Foreground.on
-            if (fg) {
-                if (!wasForeground && targetUids.isNotEmpty()) {
-                    // back after being away: the module may have timed its targets out meanwhile
+            try {
+                val fg = Foreground.on
+                if (fg && !wasForeground && targetUids.isNotEmpty()) {
+                    // back after being away: re-apply the targets only if the module dropped them
                     withContext(Dispatchers.IO) {
-                        applyTargets(ctx, targetUids)
-                        pushModuleSettings(ctx)
+                        val st = ModuleCtl.send(ctx, "list")
+                        if (st.ok && st.out.startsWith("uids=-")) {
+                            applyTargets(ctx, targetUids)
+                            pushModuleSettings(ctx)
+                        }
                     }
                 }
-                if (!log.paused) {
-                    val res = withContext(Dispatchers.IO) { Su.run("dmesg | grep SCL | tail -n 4000; true") }
-                    if (res.rc != 0) {
-                        log.status = "su failed (rc=${res.rc}): ${res.err.trim()}. Grant root to this app in APatch."
-                    } else {
-                        log.onSnapshot(res.out, res.err)
-                    }
-                }
+                if (!log.paused && (fg || tick % 3 == 0)) poll()
                 if (tick % 5 == 0 && Prefs.autoTimeout(ctx)) {
                     withContext(Dispatchers.IO) { ModuleCtl.ping(ctx) }
                 }
+                wasForeground = fg
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                log.status = "Error: ${e.message ?: e}"
             }
-            wasForeground = fg
             tick++
             delay(1000)
         }

@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * syscall_logger.c (v0.10.0) - KPM tracing syscalls of target apps and what they spawn.
+ * syscall_logger.c (v0.10.1) - KPM tracing syscalls of target apps and what they spawn.
  *
  * Tracking:
  *  - A process is traced when it is in the tgid table, belongs to a seed uid
@@ -71,7 +71,7 @@
 #include <asm/current.h>
 
 KPM_NAME("syscall_logger");
-KPM_VERSION("0.10.0");
+KPM_VERSION("0.10.1");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("you");
 KPM_DESCRIPTION("Trace syscalls of up to 8 target apps and everything they spawn");
@@ -220,7 +220,7 @@ static unsigned long ucopy(void *to, const void *from, unsigned long n)
 }
 static scnprintf_t kf_scnprintf = 0;
 /* heartbeat: app must `ping` periodically or the target is auto-cleared */
-static long (*kf_now)(void) = 0; /* seconds, ktime_get_real_seconds/ktime_get_seconds */
+static long (*kf_now)(void) = 0; /* seconds, ktime_get_seconds/ktime_get_real_seconds */
 static volatile long last_ping = 0;
 static volatile int wr_mode = 0;    /* `wr 1`: also log printable write() payloads */
 static volatile int hb_enabled = 1; /* `hb 0` disables the auto-clear, kf_now resolved or not */
@@ -1503,7 +1503,8 @@ static long syscall_logger_init(const char *args, const char *event, void *__use
 	}
 
 	/* heartbeat optional: missing symbol just disables the auto-clear safety net */
-	kf_now = (void *)lookup3("ktime_get_real_seconds", "ktime_get_seconds", 0);
+	/* monotonic first: a wall-clock step (NTP) must not trigger or block the timeout */
+	kf_now = (void *)lookup3("ktime_get_seconds", "ktime_get_real_seconds", 0);
 	if (kf_now)
 		last_ping = kf_now();
 
