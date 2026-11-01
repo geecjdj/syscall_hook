@@ -3,6 +3,7 @@ package app.sclviewer
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.util.LruCache
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -37,6 +38,7 @@ import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextField
 import top.yukonga.miuix.kmp.icon.MiuixIcons
+import top.yukonga.miuix.kmp.preference.SwitchPreference
 import top.yukonga.miuix.kmp.icon.extended.Search
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
@@ -49,20 +51,21 @@ internal fun loadApps(pm: PackageManager): List<AppEntry> =
         AppEntry(pm.getApplicationLabel(ai).toString(), ai.packageName, ai.uid, system)
     }.sortedBy { it.label.lowercase() }
 
-/** Tiny in-memory icon cache: avoids re-decoding on every recomposition/scroll. */
+/** Small LRU icon cache: bounded, since the list now includes every system app too. */
 private object IconCache {
-    private val cache = HashMap<String, Bitmap?>()
+    private val cache = LruCache<String, Bitmap>(256)
+    private val missing = HashSet<String>()
 
     @Synchronized
     fun get(pm: PackageManager, pkg: String): Bitmap? {
-        cache[pkg]?.let { return it }
-        val b = try {
-            pm.getApplicationIcon(pkg).toBitmap(96, 96)
+        cache.get(pkg)?.let { return it }
+        if (pkg in missing) return null
+        return try {
+            pm.getApplicationIcon(pkg).toBitmap(96, 96).also { cache.put(pkg, it) }
         } catch (t: Throwable) {
+            missing.add(pkg)
             null
         }
-        cache[pkg] = b
-        return b
     }
 }
 
@@ -76,25 +79,26 @@ internal fun AppsScreen(
     notice: String,
     selected: List<String>,
     tracedUids: List<Int>,
-    showSystem: Boolean,
     bottomPadding: Dp,
     onToggle: (String) -> Unit,
     onTrace: (AppEntry) -> Unit,
     onUserScroll: () -> Unit
 ) {
+    val ctx = LocalContext.current
     var query by remember { mutableStateOf("") }
+    var showSystem by remember { mutableStateOf(Prefs.showSystem(ctx)) }
     // Currently traced app(s) first, then checked-but-not-yet-traced ones, then the rest -
     // each group kept alphabetical. Re-sorts only when tracedUids/selected actually change, not
     // on every recomposition, so the list does not jump around while scrolling.
-    val shown = remember(apps, query, showSystem, selected, tracedUids) {
+    val shown = remember(apps, query, showSystem, selected.toList(), tracedUids) {
         val q = query.lowercase()
         val tracedSet = tracedUids.toSet()
+        val selectedSet = selected.toSet()
         apps.filter {
-            (showSystem || !it.system) &&
-                (q.isEmpty() || it.label.lowercase().contains(q) || it.pkg.lowercase().contains(q))
+            (showSystem || !it.system) && (q.isEmpty() || it.label.lowercase().contains(q) || it.pkg.lowercase().contains(q))
         }.sortedWith(
             compareByDescending<AppEntry> { tracedSet.contains(it.uid) }
-                .thenByDescending { selected.contains(it.pkg) }
+                .thenByDescending { selectedSet.contains(it.pkg) }
                 .thenBy { it.label.lowercase() }
         )
     }
@@ -107,6 +111,14 @@ internal fun AppsScreen(
             label = "Search name or package",
             leadingIcon = { Icon(MiuixIcons.Search, contentDescription = null, modifier = Modifier.padding(start = 12.dp)) },
             modifier = Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 8.dp)
+        )
+        SwitchPreference(
+            title = "Show system apps",
+            checked = showSystem,
+            onCheckedChange = {
+                showSystem = it
+                Prefs.setShowSystem(ctx, it)
+            }
         )
         if (notice.isNotEmpty()) {
             Text(
@@ -123,8 +135,8 @@ internal fun AppsScreen(
             items(shown, key = { it.pkg }) { entry ->
                 AppRow(
                     entry = entry,
-                    checked = selected.contains(entry.pkg),
-                    traced = tracedUids.contains(entry.uid),
+                    checked = entry.pkg in selected,
+                    traced = entry.uid in tracedUids,
                     onToggle = { onToggle(entry.pkg) },
                     onClick = { onTrace(entry) }
                 )
@@ -188,7 +200,7 @@ private fun AppRow(entry: AppEntry, checked: Boolean, traced: Boolean, onToggle:
                 }
             }
             Text(
-                "${entry.pkg}  -  uid ${entry.uid}",
+                "${entry.pkg}  -  uid ${entry.uid}" + if (entry.system) "  -  system" else "",
                 style = MiuixTheme.textStyles.body2,
                 color = MiuixTheme.colorScheme.onSurfaceVariantSummary
             )

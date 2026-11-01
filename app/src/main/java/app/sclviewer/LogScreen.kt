@@ -50,6 +50,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.Dp
@@ -84,13 +85,32 @@ import java.util.Locale
 // "su" is a virtual filter (matches the [!] alert marker); the rest match " <event> " as emitted
 // by the module (see emit() in syscall_logger.c).
 internal val EVENT_FILTERS = listOf(
-    "crash", "su", "execve", "connect", "setuid", "ptrace", "mount",
+    "crash", "su", "execve", "connect", "setuid", "ptrace", "mount", "access",
     "stdin", "write", "unlink", "mkdir", "rename", "socket", "bind", "dns", "http", "tls", "fork", "exit"
 )
 
+// A filter may cover several module events (the module emits setreuid/execveat/openat... too).
+private val FILTER_EVENTS = mapOf(
+    "execve" to listOf("execve", "execveat"),
+    "setuid" to listOf("setuid", "setreuid", "setresuid"),
+    "access" to listOf("openat", "faccessat", "newfstatat")
+)
+
 private const val MAX_LINES = 20000
+private const val SEEN_MAX = 16000 // must stay well above the dmesg window of the poller
 
 private val TS_RE = Regex("^\\[\\s*(\\d+\\.\\d+)]")
+
+/** Event name of a module line ("[SCL][!]pid=1 uid=2 <event> detail"), "" when not found. */
+private fun eventOf(line: String): String {
+    val u = line.indexOf(" uid=")
+    if (u < 0) return ""
+    var i = u + 5
+    while (i < line.length && line[i].isDigit()) i++
+    if (i >= line.length || line[i] != ' ') return ""
+    val e = line.indexOf(' ', i + 1)
+    return if (e < 0) line.substring(i + 1) else line.substring(i + 1, e)
+}
 
 /** Kernel timestamp of a dmesg line ("[ 1234.567890] ..."), or null when it has none. */
 private fun dmesgTs(line: String): Double? = TS_RE.find(line)?.groupValues?.get(1)?.toDoubleOrNull()
@@ -109,11 +129,11 @@ internal class LogState {
     var filterRevision by mutableStateOf(0)
     var followTail by mutableStateOf(true)
 
-    // dmesg bookkeeping: take only lines newer than what we already have (robust when the kernel
-    // buffer wraps). lastLine is the fallback for a dmesg without timestamps.
-    private var lastTs = -1.0
-    private var seenAtLastTs = setOf<String>()
-    private var useTs = true
+    // dmesg bookkeeping: every snapshot repeats the old lines, so remember which ones were seen.
+    // Timestamped lines are practically unique, and a seen-set (unlike "newer than the last
+    // timestamp") does not drop lines the kernel stamped slightly out of order across CPUs.
+    // lastLine is the fallback for a dmesg without timestamps.
+    private val seen = LinkedHashSet<String>()
     private var lastLine: String? = null
     private var baselineDone = false
 
@@ -122,9 +142,7 @@ internal class LogState {
         lines = emptyList()
         revision++
         baselineDone = false
-        lastTs = -1.0
-        seenAtLastTs = emptySet()
-        useTs = true
+        seen.clear()
         lastLine = null
         followTail = true
         status = message
@@ -132,9 +150,12 @@ internal class LogState {
 
     fun visibleLines(): List<String> {
         val active = EVENT_FILTERS.filter { filters[it] == true }
+        // match the real event field, not any " word " that happens to be inside a payload
+        val events = active.filter { it != "su" }.flatMap { f -> FILTER_EVENTS[f] ?: listOf(f) }.toSet()
+        val wantSu = "su" in active
         val q = query
         return lines.filter { l ->
-            (active.isEmpty() || active.any { f -> if (f == "su") l.contains("[!]") else l.contains(" $f ") }) &&
+            (active.isEmpty() || (wantSu && l.contains("[!]")) || eventOf(l) in events) &&
                 (q.isEmpty() || l.contains(q, ignoreCase = true))
         }
     }
@@ -149,40 +170,35 @@ internal class LogState {
         // control answers ("[SCL]ctl <token> ...") are chatter between app and module
         val all = out.split('\n').filter { it.isNotBlank() && !it.contains("SCL]ctl ") }
         if (!baselineDone) {
+            // first snapshot of a session: whatever is there is old. An empty one is fine too -
+            // then everything that shows up later is new.
             baselineDone = true
-            useTs = all.isEmpty() || all.any { dmesgTs(it) != null }
-            if (useTs) {
-                lastTs = all.mapNotNull { dmesgTs(it) }.maxOrNull() ?: -1.0
-                seenAtLastTs = all.filter { dmesgTs(it) == lastTs }.toSet()
-            } else {
-                lastLine = all.lastOrNull()
-            }
+            seen.addAll(all)
+            lastLine = all.lastOrNull()
             status = "Watching (older log lines skipped)"
             return
         }
-        var fresh: List<String> = emptyList()
-        if (useTs) {
-            fresh = all.filter { l ->
-                val t = dmesgTs(l)
-                t != null && (t > lastTs || (t == lastTs && l !in seenAtLastTs))
-            }
-            if (fresh.isNotEmpty()) {
-                val newTs = fresh.maxOf { dmesgTs(it) ?: lastTs }
-                val atNewTs = fresh.filter { dmesgTs(it) == newTs }
-                seenAtLastTs = if (newTs > lastTs) atNewTs.toSet() else seenAtLastTs + atNewTs
-                lastTs = newTs
+        val fresh: List<String>
+        if (all.any { dmesgTs(it) != null }) {
+            fresh = all.filter { seen.add(it) }
+            while (seen.size > SEEN_MAX) {
+                val it = seen.iterator()
+                it.next()
+                it.remove()
             }
         } else {
             val idx = lastLine?.let { all.lastIndexOf(it) } ?: -1
             fresh = if (idx >= 0) all.subList(idx + 1, all.size) else all
-            lastLine = all.lastOrNull() ?: lastLine
         }
+        lastLine = all.lastOrNull() ?: lastLine
         if (fresh.isNotEmpty()) {
             lines = (lines + fresh).takeLast(MAX_LINES)
             revision++
             status = "${lines.size} lines"
         } else if (lines.isEmpty()) {
             status = if (err.isNotBlank()) "dmesg: ${err.trim()}" else "Root OK, no SCL lines yet"
+        } else if (status.startsWith("su failed")) {
+            status = "${lines.size} lines" // su works again
         }
     }
 }
@@ -232,7 +248,7 @@ internal fun copyText(ctx: Context, text: String) {
 @Composable
 internal fun LogScreen(log: LogState, listState: LazyListState, bottomPadding: Dp, onUserScroll: () -> Unit) {
     val scope = rememberCoroutineScope()
-    val shown = remember(log.lines, log.query, log.filterRevision) { log.visibleLines() }
+    val shown = remember(log.revision, log.query, log.filterRevision) { log.visibleLines() }
 
     // Thumb activity: a timestamp written by the scroll hook plus a light polling loop, so a
     // scroll gesture does not recompose this screen once per event.
@@ -260,11 +276,13 @@ internal fun LogScreen(log: LogState, listState: LazyListState, bottomPadding: D
     LaunchedEffect(log.revision, log.filterRevision) {
         if (log.followTail && shown.isNotEmpty()) listState.scrollToItem(shown.size - 1)
     }
-    // Back at the very bottom (by scrolling or dragging) -> resume following.
+    // Back at the very bottom (by scrolling or dragging) -> resume following. Ignored until the
+    // list has items, so re-entering the tab does not throw away the reading position.
     LaunchedEffect(listState) {
-        snapshotFlow { listState.canScrollForward }.collect { canForward ->
-            if (!canForward) log.followTail = true
-        }
+        snapshotFlow { listState.canScrollForward to listState.layoutInfo.totalItemsCount }
+            .collect { (canForward, total) ->
+                if (!canForward && total > 0) log.followTail = true
+            }
     }
 
     Box(Modifier.fillMaxSize().nestedScroll(scrollHook)) {
@@ -389,7 +407,9 @@ private fun BoxScope.ScrollThumb(
 
 /** Vertical multi-select list of events plus a text filter. */
 @Composable
-internal fun FilterDialog(show: Boolean, log: LogState, onDismiss: () -> Unit) {
+internal fun FilterDialog(show: Boolean, log: LogState, onWritesChange: () -> Unit, onDismiss: () -> Unit) {
+    val ctx = LocalContext.current
+    var capture by remember(show) { mutableStateOf(Prefs.logWrites(ctx)) }
     OverlayDialog(
         title = "Filter",
         summary = "Events to show (none selected = all)",
@@ -404,7 +424,19 @@ internal fun FilterDialog(show: Boolean, log: LogState, onDismiss: () -> Unit) {
             modifier = Modifier.fillMaxWidth()
         )
         Card(modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
-            Column(Modifier.heightIn(max = 340.dp).verticalScroll(rememberScrollState())) {
+            SwitchPreference(
+                title = "Capture writes",
+                summary = "Module also logs printable write() payloads (noisy); view them with the write filter",
+                checked = capture,
+                onCheckedChange = {
+                    capture = it
+                    Prefs.setLogWrites(ctx, it)
+                    onWritesChange()
+                }
+            )
+        }
+        Card(modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
+            Column(Modifier.heightIn(max = 300.dp).verticalScroll(rememberScrollState())) {
                 EVENT_FILTERS.forEach { f ->
                     SwitchPreference(
                         title = f,
@@ -483,17 +515,19 @@ private fun ActionRow(icon: ImageVector, text: String, onClick: () -> Unit) {
 }
 
 @Composable
-private fun lineColor(l: String): Color = when {
-    l.contains("[!]") -> Color(0xFFE53935)
-    l.contains(" crash ") -> Color(0xFFC2185B)
-    l.contains(" execve ") || l.contains(" execveat ") -> Color(0xFF1E88E5)
-    l.contains(" connect ") -> Color(0xFF43A047)
-    l.contains(" stdin ") -> Color(0xFFFB8C00)
-    l.contains(" write ") -> Color(0xFF8D6E63)
-    l.contains(" unlink ") || l.contains(" rename ") -> Color(0xFFD81B60)
-    l.contains(" mkdir ") -> Color(0xFF8D6E63)
-    l.contains(" socket ") || l.contains(" bind ") -> Color(0xFF43A047)
-    l.contains(" dns ") -> Color(0xFF00BCD4)
-    l.contains(" http ") || l.contains(" tls ") -> Color(0xFFAB47BC)
-    else -> MiuixTheme.colorScheme.onSurface
+private fun lineColor(l: String): Color {
+    if (l.contains("[!]")) return Color(0xFFE53935)
+    return when (eventOf(l)) {
+        "crash" -> Color(0xFFC2185B)
+        "execve", "execveat" -> Color(0xFF1E88E5)
+        "setuid", "setreuid", "setresuid" -> Color(0xFFFFB300)
+        "ptrace", "mount" -> Color(0xFF6D4C41)
+        "connect", "socket", "bind" -> Color(0xFF43A047)
+        "stdin" -> Color(0xFFFB8C00)
+        "write", "mkdir" -> Color(0xFF8D6E63)
+        "unlink", "rename" -> Color(0xFFD81B60)
+        "dns" -> Color(0xFF00BCD4)
+        "http", "tls" -> Color(0xFFAB47BC)
+        else -> MiuixTheme.colorScheme.onSurface
+    }
 }

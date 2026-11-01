@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * syscall_logger.c (v0.10.0) - KPM tracing syscalls of target apps and what they spawn.
+ * syscall_logger.c (v0.10.1) - KPM tracing syscalls of target apps and what they spawn.
  *
  * Tracking:
  *  - A process is traced when it is in the tgid table, belongs to a seed uid
@@ -71,7 +71,7 @@
 #include <asm/current.h>
 
 KPM_NAME("syscall_logger");
-KPM_VERSION("0.10.0");
+KPM_VERSION("0.10.1");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("you");
 KPM_DESCRIPTION("Trace syscalls of up to 8 target apps and everything they spawn");
@@ -1002,7 +1002,15 @@ static void h_sendto(hook_fargs6_t *a, void *udata)
 
 	if (!is_target(&pid))
 		return;
-	if (len < 12 || alen < 4)
+	if (!syscall_argn(a, 4) || alen < 4) {
+		/* send() on a connected socket: no address, so look at the payload like write() */
+		int n = fetch_payload((const void __user *)syscall_argn(a, 1), len, buf, sizeof(buf));
+
+		if (n)
+			inspect_payload(pid, (int)syscall_argn(a, 0), buf, n);
+		return;
+	}
+	if (len < 12)
 		return;
 	if (alen > (int)sizeof(sa))
 		alen = (int)sizeof(sa);

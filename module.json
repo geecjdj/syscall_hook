@@ -10,7 +10,7 @@
     ],
     "license": "GPL-2.0-only",
     "moduleid": "syscall_logger",
-    "version": "0.10.0",
-    "VersionCode": 10,
+    "version": "0.10.1",
+    "VersionCode": 11,
     "downloadUrl": ""
 }

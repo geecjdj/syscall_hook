@@ -1,4 +1,4 @@
-MODULE_VERSION := 0.10.0
+MODULE_VERSION := 0.10.1
 
 ifndef KP_DIR
     KP_DIR = ../KernelPatch

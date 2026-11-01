@@ -30,23 +30,16 @@ import top.yukonga.miuix.kmp.basic.TextField
 import top.yukonga.miuix.kmp.preference.SwitchPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
-/**
- * Everything that used to be scattered over the log screen and a dialog: auto timeout, log
- * writes, system apps, legacy mode + SuperKey, and the module's state. Changes are saved as they
- * are made.
- */
+/** Auto timeout, legacy mode + SuperKey and the module's state. Changes are saved as they are made. */
 @Composable
 internal fun SettingsScreen(
     bottomPadding: Dp,
-    onShowSystemChange: (Boolean) -> Unit,
     onModuleSettingsChanged: () -> Unit,
     onUserScroll: () -> Unit
 ) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     var autoTimeout by remember { mutableStateOf(Prefs.autoTimeout(ctx)) }
-    var logWrites by remember { mutableStateOf(Prefs.logWrites(ctx)) }
-    var showSystem by remember { mutableStateOf(Prefs.showSystem(ctx)) }
     var legacy by remember { mutableStateOf(Prefs.legacyMode(ctx)) }
     var key by remember { mutableStateOf(Prefs.superKey(ctx)) }
     var moduleState by remember { mutableStateOf("Checking module...") }
@@ -76,25 +69,6 @@ internal fun SettingsScreen(
                     autoTimeout = it
                     Prefs.setAutoTimeout(ctx, it)
                     onModuleSettingsChanged()
-                }
-            )
-            SwitchPreference(
-                title = "Log writes",
-                summary = "Also log printable write() payloads (noisy)",
-                checked = logWrites,
-                onCheckedChange = {
-                    logWrites = it
-                    Prefs.setLogWrites(ctx, it)
-                    onModuleSettingsChanged()
-                }
-            )
-            SwitchPreference(
-                title = "Show system apps",
-                checked = showSystem,
-                onCheckedChange = {
-                    showSystem = it
-                    Prefs.setShowSystem(ctx, it)
-                    onShowSystemChange(it)
                 }
             )
         }

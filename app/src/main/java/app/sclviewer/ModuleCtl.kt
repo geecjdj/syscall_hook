@@ -35,7 +35,7 @@ object ModuleCtl {
         if (!SAFE.matches(cmd)) return Result(false, "", "Bad command")
         val tok = Random.nextInt(0x100000, 0xFFFFFF).toString(16)
         val script = "readlink '/.scl:$tok $cmd' >/dev/null 2>&1; " +
-            "dmesg | tail -n 3000 | grep 'SCL]ctl $tok ' | tail -n 1; true"
+            "dmesg | grep -F 'SCL]ctl $tok ' | tail -n 1; true"
         val r = Su.run(script)
         if (r.rc != 0) {
             return Result(false, "", "su failed (rc=${r.rc}): ${r.err.trim()}. Grant root to this app in APatch.")
